@@ -1,0 +1,32 @@
+# Exclude git repository data
+.git
+.gitignore
+
+# Exclude virtual environments and caches
+venv/
+.pytest_cache/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Exclude local runtime data, databases, and logs (persisted via docker-compose volumes)
+data/
+logs/
+models/
+
+# Exclude environment variables configuration (injected at runtime)
+.env
+
+# Exclude IDE and workspace files
+.idea/
+.vscode/
+.gemini/
+.agents/
+
+# Exclude local scratch files and documentation
+notebooks/
+architecture/
+tests/
+requirements-dev.txt
+README.md

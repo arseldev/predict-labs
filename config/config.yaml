@@ -1,0 +1,84 @@
+# ============================================
+# BTC 5-Minute Prediction System Configuration
+# ============================================
+
+binance:
+  symbol: "BTCUSDT"
+  testnet: true                     # WAJIB true sampai Phase 6 selesai!
+  # API keys dibaca dari .env — JANGAN hardcode di sini
+
+data:
+  timeframes:
+    primary: "5m"
+    context:
+      - "1m"
+      - "15m"
+      - "1h"
+  raw_path: "data/raw"
+  processed_path: "data/processed"
+  parquet_compression: "snappy"
+  orderbook:
+    depth_levels: 20
+    snapshot_interval_sec: 30
+  history:
+    days_back: 29
+
+features:
+  lookback_candles: 100
+  rsi_period: 14
+  atr_period: 14
+  ema_fast: 9
+  ema_slow: 21
+  vol_ma_period: 20
+  obi_levels:
+    - 1
+    - 3
+    - 5
+    - 10
+
+labeling:
+  method: "triple_barrier"          # "fixed_horizon" atau "triple_barrier"
+  fixed_horizon:
+    n_candles_ahead: 1
+  triple_barrier:
+    profit_pct: 0.006               # +0.60% take profit
+    loss_pct: 0.004                 # -0.40% stop loss
+    max_candles: 12                 # Max 1 jam (12 × 5m)
+
+model:
+  primary: "lightgbm"              # "lightgbm", "xgboost", "logistic_regression"
+  lightgbm:
+    n_estimators: 500
+    max_depth: 6
+    learning_rate: 0.05
+    num_leaves: 63
+    min_child_samples: 50
+    subsample: 0.8
+    colsample_bytree: 0.8
+    random_state: 42
+
+validation:
+  method: "walk_forward"
+  walk_forward:
+    n_splits: 5
+    train_period_days: 15
+    test_period_days: 2
+    embargo_periods: 12             # 1 jam embargo (12 × 5m)
+    min_train_samples: 500
+
+trading:
+  fee_taker: 0.001                  # 0.10% fee taker
+  fee_maker: 0.001                  # 0.10% fee maker
+  slippage_pct: 0.0002              # 0.02% estimasi slippage
+  probability_threshold: 0.60      # Min P(naik) untuk entry
+  position_size_pct: 0.02          # 2% kapital per trade
+  profit_target_pct: 0.006        # TP: +0.60%
+  stop_loss_pct: 0.004            # SL: -0.40%
+  max_hold_candles: 12            # Maksimal hold posisi (1 jam)
+  max_daily_loss_pct: 0.03         # Kill-switch: stop jika rugi >3%/hari
+  max_weekly_loss_pct: 0.08        # Kill-switch: stop jika rugi >8%/minggu
+
+logging:
+  db_path: "logs/predictions.db"
+  log_path: "logs/system.log"
+  log_level: "INFO"
