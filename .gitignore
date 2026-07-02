@@ -9,4 +9,4 @@ logs/*.db
 logs/*.log
 data/raw/
 data/processed/
-models/*.pkl
+# models/*.pkl
