@@ -13,6 +13,10 @@ import os
 import time
 from loguru import logger
 import pandas as pd
+from dotenv import load_dotenv
+
+# Load environment variables
+load_dotenv()
 
 from src.data_fetch import load_config, get_binance_client, fetch_all_historical_klines
 from src.features import build_all_features

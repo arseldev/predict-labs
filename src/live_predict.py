@@ -188,6 +188,18 @@ class LivePredictor:
         self.executor = OrderExecutor(config)
         self._pred_logger = PredictionLogger(config["logging"]["db_path"])
         
+        # Setup Telegram logging if credentials exist in env
+        bot_token = os.getenv("BOT_TOKEN")
+        bot_target_id = os.getenv("BOT_TARGET_ID")
+        self.telegram_handler = None
+        if bot_token and bot_target_id:
+            from src.telegram_utils import TelegramBufferedHandler
+            self.telegram_handler = TelegramBufferedHandler(bot_token, str(bot_target_id))
+            logger.add(self.telegram_handler.write, level="INFO")
+            logger.info("📢 Telegram logging sink initialized successfully!")
+        else:
+            logger.warning("⚠️ BOT_TOKEN or BOT_TARGET_ID not found in env. Telegram logs disabled.")
+            
         self._running = False
         
     def start(self):
@@ -307,6 +319,15 @@ class LivePredictor:
                 
         except Exception as e:
             logger.error(f"Error processing signal: {e}", exc_info=True)
+        finally:
+            if self.telegram_handler:
+                try:
+                    # Ambil timestamp dari try block if available, else current time
+                    t_str = str(pd.Timestamp.now(tz=None))
+                    msg_time = locals().get("timestamp", t_str)
+                    self.telegram_handler.flush_to_telegram(header=f"🤖 BTC 5m Prediction/Save @ {msg_time}")
+                except Exception as e:
+                    print(f"Failed to flush telegram handler: {e}")
 
     def stop(self):
         self._running = False
