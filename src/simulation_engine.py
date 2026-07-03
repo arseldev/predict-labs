@@ -70,42 +70,24 @@ class SimulationEngine:
             logger.debug("Sudah ada posisi simulasi aktif, lewati sinyal baru.")
             return
 
-        # Hitung quantity simulasi berdasarkan flat $1.00 USD per trade
-        position_size_usd = 1.0
-        quantity = position_size_usd / entry_price
-        
-        # Hitung level TP/SL
-        if direction == "UP":
-            tp_price = entry_price * (1.0 + self.tp_pct)
-            sl_price = entry_price * (1.0 - self.sl_pct)
-        else:  # DOWN (Short)
-            tp_price = entry_price * (1.0 - self.tp_pct)
-            sl_price = entry_price * (1.0 + self.sl_pct)
-            
+        # Sinyal simulasi baru dengan flat $1.00 USD
         self._position = {
             "entry_time": timestamp,
             "entry_price": entry_price,
-            "quantity": quantity,
             "direction": direction,
             "predicted_proba": proba,
-            "fee_paid": position_size_usd * self.fee_pct,
-            "candles_held": 0,
-            "tp_price": round(tp_price, 2),
-            "sl_price": round(sl_price, 2),
+            "candles_held": 0
         }
         
         logger.info(
-            f"🚀 [SIMULATION ENTRY] Masuk {direction} @ {entry_price:.2f} USDT | "
-            f"TP: {self._position['tp_price']:.2f} | SL: {self._position['sl_price']:.2f} | "
-            f"Quantity: {quantity:.5f} BTC"
+            f"🚀 [SIMULATION ENTRY] Prediksi {direction} @ {entry_price:.2f} USDT (Bet Size: $1.00 USD)"
         )
         
         # Kirim notifikasi Telegram jika handler terdaftar
         self._send_telegram_notification(
-            f"🚀 <b>SIMULASI ENTRY: {direction}</b>\n"
+            f"🚀 <b>SIMULASI ENTRY PREDIKSI 5M: {direction}</b>\n"
             f"Harga Entry: ${entry_price:,.2f}\n"
-            f"Target TP: ${self._position['tp_price']:,.2f} (+{self.tp_pct:.2%})\n"
-            f"Target SL: ${self._position['sl_price']:,.2f} (-{self.sl_pct:.2%})\n"
+            f"Bet Size: $1.00 USD\n"
             f"Confidence: {proba:.2%}"
         )
 
@@ -118,59 +100,35 @@ class SimulationEngine:
             return
 
         pos = self._position
-        pos["candles_held"] += 1
         
-        high = float(candle_close_data["high"])
-        low = float(candle_close_data["low"])
         close = float(candle_close_data["close"])
+        open_val = float(candle_close_data["open"])
         close_time = candle_close_data["close_time"]
         
-        exit_price = None
-        exit_reason = None
-        
-        # Cek TP/SL
+        # Tentukan tebakan benar atau salah
         if pos["direction"] == "UP":
-            # Jika high menyentuh TP dan low menyentuh SL pada candle yang sama, kita asumsikan SL kena duluan (konservatif)
-            if high >= pos["tp_price"] and low <= pos["sl_price"]:
-                exit_price = pos["sl_price"]
-                exit_reason = "stop_loss"
-            elif low <= pos["sl_price"]:
-                exit_price = pos["sl_price"]
-                exit_reason = "stop_loss"
-            elif high >= pos["tp_price"]:
-                exit_price = pos["tp_price"]
-                exit_reason = "take_profit"
-        else:  # DOWN (Short)
-            if low <= pos["tp_price"] and high >= pos["sl_price"]:
-                exit_price = pos["sl_price"]
-                exit_reason = "stop_loss"
-            elif high >= pos["sl_price"]:
-                exit_price = pos["sl_price"]
-                exit_reason = "stop_loss"
-            elif low <= pos["tp_price"]:
-                exit_price = pos["tp_price"]
-                exit_reason = "take_profit"
-                
-        # Cek Timeout
-        if exit_price is None and pos["candles_held"] >= self.max_hold_candles:
-            exit_price = close
-            exit_reason = "timeout"
+            win = close > open_val
+        else: # DOWN
+            win = close < open_val
             
-        # Jika exit terdeteksi, catat trade
-        if exit_price is not None:
-            self._close_position(exit_price, exit_reason, close_time)
+        draw = close == open_val
+        
+        if draw:
+            exit_reason = "DRAW"
+            net_pnl = 0.0
+        elif win:
+            exit_reason = "WIN"
+            # Profit bersih $0.85 jika tebakan benar (asumsi payout multiplier 1.85x)
+            net_pnl = 0.85
+        else:
+            exit_reason = "LOSS"
+            # Rugi modal $1.00 jika tebakan salah
+            net_pnl = -1.00
+            
+        self._close_position(close, exit_reason, net_pnl, close_time)
 
-    def _close_position(self, exit_price: float, exit_reason: str, exit_time):
+    def _close_position(self, exit_price: float, outcome: str, net_pnl: float, exit_time):
         pos = self._position
-        
-        # Hitung PnL
-        if pos["direction"] == "UP":
-            gross_pnl = (exit_price - pos["entry_price"]) * pos["quantity"]
-        else:  # DOWN
-            gross_pnl = (pos["entry_price"] - exit_price) * pos["quantity"]
-            
-        fee_exit = exit_price * pos["quantity"] * self.fee_pct
-        net_pnl = gross_pnl - pos["fee_paid"] - fee_exit
         
         # Update balance
         new_balance = self.simulated_balance + net_pnl
@@ -182,34 +140,34 @@ class SimulationEngine:
             "exit_time": str(exit_time),
             "entry_price": pos["entry_price"],
             "exit_price": exit_price,
-            "quantity": pos["quantity"],
+            "quantity": 1.0, # Taruhan flat $1.00
             "direction": pos["direction"].lower(),
-            "gross_pnl": gross_pnl,
+            "gross_pnl": net_pnl,
             "net_pnl": net_pnl,
-            "fee_paid": pos["fee_paid"] + fee_exit,
-            "exit_reason": exit_reason,
+            "fee_paid": 0.0,
+            "exit_reason": outcome,
             "predicted_proba": pos["predicted_proba"],
         }
         
         if self._pred_logger:
             self._pred_logger.log_trade(trade_data)
             logger.info(
-                f"✅ [SIMULATION EXIT] {exit_reason.upper()} | Direction: {pos['direction']} | "
-                f"Entry: {pos['entry_price']:.2f} → Exit: {exit_price:.2f} | "
-                f"Net PnL: ${net_pnl:.2f} | Balance Baru: ${new_balance:.2f}"
+                f"✅ [SIMULATION EXIT] {outcome} | Direction: {pos['direction']} | "
+                f"Entry Price: {pos['entry_price']:.2f} → Exit Price: {exit_price:.2f} | "
+                f"Net PnL: {net_pnl:+.2f} USD | Balance: ${new_balance:.2f}"
             )
         else:
             logger.warning("Warning: pred_logger tidak di-set di SimulationEngine, trade tidak disimpan ke DB!")
             
         # Kirim notifikasi Telegram
-        pnl_icon = "🟢" if net_pnl > 0 else "🔴"
+        pnl_icon = "🟢" if net_pnl > 0 else ("🟡" if net_pnl == 0 else "🔴")
         self._send_telegram_notification(
-            f"{pnl_icon} <b>SIMULASI EXIT: {exit_reason.upper()}</b>\n"
-            f"Arah Trade: {pos['direction']}\n"
+            f"{pnl_icon} <b>SIMULASI PREDIKSI 5M SELESAI: {outcome}</b>\n"
+            f"Tebakan Arah: {pos['direction']}\n"
             f"Harga Entry: ${pos['entry_price']:,.2f}\n"
-            f"Harga Exit: ${exit_price:,.2f}\n"
-            f"Net PnL: <b>${net_pnl:+.2f}</b>\n"
-            f"Balance Simulasi: ${new_balance:,.2f}"
+            f"Harga Exit (5m): ${exit_price:,.2f}\n"
+            f"Hasil PnL: <b>{net_pnl:+.2f} USD</b>\n"
+            f"Saldo Terkini: ${new_balance:,.2f}"
         )
         
         # Reset posisi
