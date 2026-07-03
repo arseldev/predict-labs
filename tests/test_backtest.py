@@ -45,49 +45,50 @@ class TestBacktest:
             # Indeks entry_time harus berupa baris T+1
             assert trade.entry_time > df.index[0], "Entry time terjadi terlalu cepat!"
             
-    def test_fee_applied(self):
-        """Fee harus diterapkan untuk setiap trade (entry + exit)."""
-        df = make_dummy_kline_with_features(50)
+    def test_payout_calculation(self):
+        """Verifikasi bahwa payout (+0.85 untuk WIN, -1.00 untuk LOSS) dihitung secara akurat."""
+        df = make_dummy_kline_with_features(5)
+        df.iloc[0, df.columns.get_loc("close")] = 50000.0
+        df.iloc[1, df.columns.get_loc("open")] = 50000.0
+        df.iloc[1, df.columns.get_loc("close")] = 50100.0 # candle T=1 close > open => UP win
+        
+        df.iloc[2, df.columns.get_loc("open")] = 50000.0
+        df.iloc[2, df.columns.get_loc("close")] = 49900.0 # candle T=2 close < open => DOWN win
+        
         model = MockModel(always_predict_proba=0.8)
-        config = BacktestConfig(fee_taker=0.001, slippage_pct=0.0)
+        config = BacktestConfig(probability_threshold=0.60, win_payout_pct=0.85, loss_payout_pct=-1.00)
         trades, _ = run_backtest(df, model, FEATURE_COLS, config)
         
-        assert len(trades) > 0, "Tidak ada trade yang di-generate"
-        for trade in trades:
-            assert trade.fee_paid > 0.0, "Fee tidak diterapkan pada trade"
-            
+        assert len(trades) >= 2
+        # Trade ke-0 (sinyal di candle 0, eksekusi di candle 1):
+        assert trades[0].direction == "up"
+        assert trades[0].exit_reason == "WIN"
+        assert trades[0].net_pnl == 0.85
+        
+        # Trade ke-1 (sinyal di candle 1, eksekusi di candle 2):
+        assert trades[1].direction == "up"
+        assert trades[1].exit_reason == "LOSS"
+        assert trades[1].net_pnl == -1.00
+
     def test_capital_never_negative(self):
         """Kapital di equity curve tidak boleh negatif."""
         df = make_dummy_kline_with_features(200)
         model = MockModel(always_predict_proba=0.8)
-        config = BacktestConfig(initial_capital=1000.0, position_size_pct=0.10)
+        config = BacktestConfig(initial_capital=1000.0)
         trades, equity = run_backtest(df, model, FEATURE_COLS, config)
         
         assert (equity["equity"] >= 0).all(), "Kapital bernilai negatif!"
 
-    def test_kill_switch_stops_trading(self):
-        """Kill switch harian harus menghentikan trading ketika akumulasi kerugian harian melebihi limit."""
-        df = make_dummy_kline_with_features(200)
-        # Buat harga turun drastis di candle-candle berikutnya agar SL terus kena
-        df["close"] = df["close"] * 0.90
-        df["low"] = df["low"] * 0.85
-        df["open"] = df["open"] * 0.95
+    def test_two_way_predictions(self):
+        """Verifikasi bahwa arah DOWN dieksekusi jika proba <= 1 - threshold."""
+        df = make_dummy_kline_with_features(5)
+        model = MockModel(always_predict_proba=0.2)
+        config = BacktestConfig(probability_threshold=0.60)
+        trades, _ = run_backtest(df, model, FEATURE_COLS, config)
         
-        model = MockModel(always_predict_proba=0.9)
-        # Batasi loss harian maksimal 1%
-        config = BacktestConfig(
-            initial_capital=10000.0,
-            stop_loss_pct=0.01,
-            position_size_pct=0.50,       # 50% capital = $5000 per trade
-            max_daily_loss_pct=0.01       # Kill switch jika rugi >$100 harian
-        )
-        
-        trades, equity = run_backtest(df, model, FEATURE_COLS, config)
-        
-        # Karena position size besar (50%) dan SL 1% (rugi $50 per trade + fees),
-        # setelah 2 atau 3 kali SL kena, kerugian harian akan melebihi $100 (1%).
-        # Bot harus berhenti masuk posisi baru untuk hari itu.
-        assert len(trades) < 10, "Bot tetap bertransaksi meskipun kill-switch seharusnya menyala"
+        assert len(trades) > 0
+        for trade in trades:
+            assert trade.direction == "down"
 
     def test_ev_calculation(self):
         """Verifikasi formula EV di evaluate.py dihitung dengan benar."""

@@ -213,18 +213,19 @@ def compute_backtest_metrics(
         exit_counts[t.exit_reason] = exit_counts.get(t.exit_reason, 0) + 1
     exit_breakdown = {reason: float(count / len(trades)) for reason, count in exit_counts.items()}
     
-    # Probability Calibration
-    buckets = {"0.60-0.65": [], "0.65-0.70": [], "0.70-0.75": [], "0.75+": []}
+    # Probability Calibration based on confidence (max(p, 1-p))
+    buckets = {"0.52-0.60": [], "0.60-0.70": [], "0.70-0.80": [], "0.80+": []}
     for t in trades:
         p = t.predicted_proba
-        if p < 0.65:
-            bucket = "0.60-0.65"
-        elif p < 0.70:
-            bucket = "0.65-0.70"
-        elif p < 0.75:
-            bucket = "0.70-0.75"
+        conf = max(p, 1.0 - p)
+        if conf < 0.60:
+            bucket = "0.52-0.60"
+        elif conf < 0.70:
+            bucket = "0.60-0.70"
+        elif conf < 0.80:
+            bucket = "0.70-0.80"
         else:
-            bucket = "0.75+"
+            bucket = "0.80+"
         buckets[bucket].append(t.net_pnl > 0)
         
     prob_buckets = {
