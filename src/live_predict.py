@@ -352,6 +352,14 @@ class LivePredictor:
             timestamp = df_features.index[-1]
             entry_price = float(df_5m["close"].iloc[-1]) # harga entry adalah close candle 5m yang barusan ditutup
             
+            # Tambahkan jeda kecil (entry delay) agar pool settle
+            entry_delay = self.config.get("trading", {}).get("entry_delay_sec", 0)
+            if entry_delay > 0:
+                logger.info(f"Applying entry delay of {entry_delay} seconds for pool stabilization...")
+                time.sleep(entry_delay)
+                # Ambil close/price terupdate jika diperlukan (namun untuk binary predict 5m, harga open T+1
+                # seringkali direpresentasikan oleh close T, tetapi kita beri jeda agar pool Binance Predict settle)
+            
             # Tentukan arah berdasarkan threshold
             threshold_up = self.threshold
             threshold_down = 1.0 - self.threshold
@@ -386,7 +394,7 @@ class LivePredictor:
                         proba=proba,
                         entry_price=entry_price,
                         timestamp=timestamp,
-                        market_ratio_up=proba # Menggunakan probabilitas model sebagai market ratio
+                        market_ratio_up=None  # Biarkan engine ambil dari config
                     )
                     if pos and self.telegram_notifier:
                         self.telegram_notifier.send(

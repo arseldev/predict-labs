@@ -24,12 +24,12 @@ class BacktestConfig:
     position_size_pct: float = 0.02      # 2% dari kapital per trade
     max_daily_loss_pct: float = 0.03     # Stop trading jika rugi >3% sehari
     max_weekly_loss_pct: float = 0.08    # Stop trading jika rugi >8% seminggu
-    use_triple_barrier: bool = True
-    profit_target_pct: float = 0.0015    # TP: +0.15% (tidak aktif untuk binary predict)
-    stop_loss_pct: float = 0.0015        # SL: -0.15% (tidak aktif untuk binary predict)
-    max_hold_candles: int = 6            # Maksimal hold posisi (30 menit)
+    use_triple_barrier: bool = True      # NOT IMPLEMENTED (exit selalu fixed T+1)
+    profit_target_pct: float = 0.0015    # TP: +0.15% (NOT IMPLEMENTED)
+    stop_loss_pct: float = 0.0015        # SL: -0.15% (NOT IMPLEMENTED)
+    max_hold_candles: int = 6            # Maksimal hold posisi (NOT IMPLEMENTED)
     bet_size_usd: float = 1.0            # Taruhan flat $1.00 USD
-    pool_ratio_source: str = "model_proba" # "model_proba" atau "fixed"
+    pool_ratio_source: str = "fixed"     # "fixed" atau "historical" (model_proba is deprecated)
     fixed_ratio_up: float = 0.50         # Rasio default jika source="fixed"
     platform_fee_pct: float = 0.01       # 1% platform fee
 
@@ -89,8 +89,51 @@ def run_backtest(
         else:
             all_probas = np.array([0.5] * n)
             
+    # Tracking daily/weekly loss
+    current_day = None
+    current_week = None
+    day_start_capital = capital
+    week_start_capital = capital
+    daily_stopped = False
+    weekly_stopped = False
+    
     for i in range(n - 1):
         timestamp = df.index[i]
+        
+        # Pengecekan limit harian dan mingguan
+        ts_day = timestamp.date()
+        ts_week = timestamp.isocalendar()[:2]
+        
+        # Reset harian
+        if ts_day != current_day:
+            current_day = ts_day
+            day_start_capital = capital
+            daily_stopped = False
+            
+        # Reset mingguan
+        if ts_week != current_week:
+            current_week = ts_week
+            week_start_capital = capital
+            weekly_stopped = False
+            
+        # Hitung persentase drawdown dari awal periode
+        daily_loss_pct = (capital - day_start_capital) / day_start_capital
+        weekly_loss_pct = (capital - week_start_capital) / week_start_capital
+        
+        if daily_loss_pct <= -config.max_daily_loss_pct:
+            if not daily_stopped:
+                logger.warning(f"[{timestamp}] Daily loss limit hit ({daily_loss_pct:.2%}). Stopping entries for today.")
+                daily_stopped = True
+            equity_curve.append({"timestamp": timestamp, "equity": capital})
+            continue
+            
+        if weekly_loss_pct <= -config.max_weekly_loss_pct:
+            if not weekly_stopped:
+                logger.warning(f"[{timestamp}] Weekly loss limit hit ({weekly_loss_pct:.2%}). Stopping entries for this week.")
+                weekly_stopped = True
+            equity_curve.append({"timestamp": timestamp, "equity": capital})
+            continue
+
         row = df.iloc[i] # candle T
         next_row = df.iloc[i + 1] # candle T+1
         
@@ -121,7 +164,9 @@ def run_backtest(
             if config.pool_ratio_source == "fixed":
                 market_ratio_up = config.fixed_ratio_up
             else:
-                market_ratio_up = proba # Proxy: proba model
+                # DEPRECATED: model_proba menyebabkan circular bias
+                logger.warning("pool_ratio_source='model_proba' is deprecated. Using fixed=0.50 as baseline.")
+                market_ratio_up = config.fixed_ratio_up
                 
             # Hitung harga token UP/DOWN (0.01 - 0.99)
             if direction == "up":

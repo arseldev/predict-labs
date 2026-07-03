@@ -324,7 +324,16 @@ def build_all_features(
         df = add_trade_flow_imbalance(df, trades_df)
         
     initial_rows = len(df)
+    
+    # Log persentase NaN per kolom sebelum dropna
+    nan_counts = df.isna().sum()
+    if nan_counts.sum() > 0:
+        nan_pct = (nan_counts / initial_rows * 100).round(2)
+        cols_with_nan = nan_pct[nan_pct > 0].sort_values(ascending=False)
+        logger.warning(f"Detected NaN in features before dropna (out of {initial_rows} rows):\n{cols_with_nan.to_string()}")
+        
     df = df.dropna()
-    logger.info(f"Feature build complete: {initial_rows} → {len(df)} rows after dropna")
+    dropped_rows = initial_rows - len(df)
+    logger.info(f"Feature build complete: {initial_rows} → {len(df)} rows after dropna (dropped {dropped_rows} rows, {dropped_rows/initial_rows*100:.2f}%)")
     
     return df

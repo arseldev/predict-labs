@@ -80,7 +80,8 @@ trading:
   predict_market:
     bet_size_usd: 1.0              # Taruhan flat per prediksi
     platform_fee_pct: 0.01         # Fee Binance Predict (1% dari bet)
-    pool_ratio_source: "model_proba" # "model_proba" atau "fixed"
+    entry_delay_sec: 5             # Jeda waktu (detik) setelah candle closed sebelum entry/check pool
+    pool_ratio_source: "historical" # "fixed" atau "historical" (menggunakan real-time ratio)
     fixed_ratio_up: 0.50           # Hanya dipakai jika pool_ratio_source="fixed"
 
 
