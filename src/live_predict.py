@@ -91,9 +91,20 @@ class PredictionLogger:
                 fee_paid REAL,
                 exit_reason TEXT,
                 predicted_proba REAL,
+                entry_cost REAL,
+                market_ratio_up REAL,
                 created_at TEXT DEFAULT CURRENT_TIMESTAMP
             )
         """)
+        
+        # Migrasi jika kolom baru belum ada
+        cursor.execute("PRAGMA table_info(trades)")
+        trade_columns = [col[1] for col in cursor.fetchall()]
+        if "entry_cost" not in trade_columns:
+            cursor.execute("ALTER TABLE trades ADD COLUMN entry_cost REAL")
+        if "market_ratio_up" not in trade_columns:
+            cursor.execute("ALTER TABLE trades ADD COLUMN market_ratio_up REAL")
+            
         conn.commit()
         conn.close()
         
@@ -121,8 +132,8 @@ class PredictionLogger:
         cursor.execute("""
             INSERT INTO trades 
             (signal_timestamp, entry_time, exit_time, entry_price, exit_price,
-             quantity, direction, gross_pnl, net_pnl, fee_paid, exit_reason, predicted_proba)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             quantity, direction, gross_pnl, net_pnl, fee_paid, exit_reason, predicted_proba, entry_cost, market_ratio_up)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
             str(trade_data.get("signal_timestamp", "")),
             str(trade_data.get("entry_time", "")),
@@ -135,7 +146,9 @@ class PredictionLogger:
             float(trade_data.get("net_pnl", 0.0)),
             float(trade_data.get("fee_paid", 0.0)),
             str(trade_data.get("exit_reason", "")),
-            float(trade_data.get("predicted_proba", 0.0))
+            float(trade_data.get("predicted_proba", 0.0)),
+            float(trade_data.get("entry_cost")) if trade_data.get("entry_cost") is not None else None,
+            float(trade_data.get("market_ratio_up")) if trade_data.get("market_ratio_up") is not None else None
         ))
         conn.commit()
         conn.close()
@@ -222,17 +235,17 @@ class LivePredictor:
         # Setup Telegram logging if credentials exist in env
         bot_token = os.getenv("BOT_TOKEN")
         bot_target_id = os.getenv("BOT_TARGET_ID")
-        self.telegram_handler = None
-        self._pred_counter = 0
+        self.telegram_notifier = None
         if bot_token and bot_target_id:
-            from src.telegram_utils import TelegramBufferedHandler
-            self.telegram_handler = TelegramBufferedHandler(bot_token, str(bot_target_id))
-            logger.add(self.telegram_handler.write, level="INFO")
-            logger.info("📢 Telegram logging sink initialized successfully!")
+            from src.telegram_utils import TelegramNotifier
+            self.telegram_notifier = TelegramNotifier(bot_token, str(bot_target_id))
+            logger.info("📢 Telegram notifier initialized successfully!")
+            self.telegram_notifier.send("🤖 <b>BTC 5m Bot successfully initialized!</b>")
         else:
             logger.warning("⚠️ BOT_TOKEN or BOT_TARGET_ID not found in env. Telegram logs disabled.")
             
         self._running = False
+
         
     def start(self):
         logger.info("Starting LivePredictor...")
@@ -368,12 +381,21 @@ class LivePredictor:
             
             if signal:
                 if self.simulate_mode:
-                    self.executor.submit_order(
+                    pos = self.executor.submit_order(
                         direction=direction,
                         proba=proba,
                         entry_price=entry_price,
-                        timestamp=timestamp
+                        timestamp=timestamp,
+                        market_ratio_up=proba # Menggunakan probabilitas model sebagai market ratio
                     )
+                    if pos and self.telegram_notifier:
+                        self.telegram_notifier.send(
+                            f"🚀 <b>SIMULASI ENTRY PREDIKSI 5M: {direction}</b>\n"
+                            f"Harga Entry: ${entry_price:,.2f}\n"
+                            f"Token Price: {pos['entry_cost']:.2f} USDT\n"
+                            f"Bet Size: ${pos['bet_size']:.2f}\n"
+                            f"Confidence: {proba:.2%}"
+                        )
                 else:
                     # Di real order executor (order_market_buy dll) hanya long yang didukung.
                     # Kita tetap pass ke executor.
@@ -382,21 +404,68 @@ class LivePredictor:
                         proba=proba,
                         timestamp=timestamp
                     )
+                    if self.telegram_notifier:
+                        self.telegram_notifier.send(
+                            f"🚀 <b>LIVE ENTRY PREDIKSI 5M: {direction}</b>\n"
+                            f"Harga Entry: ${entry_price:,.2f}\n"
+                            f"Confidence: {proba:.2%}"
+                        )
                 
         except Exception as e:
             logger.error(f"Error processing signal: {e}", exc_info=True)
-        finally:
-            if self.telegram_handler:
-                self._pred_counter += 1
-                if self._pred_counter >= 3:
-                    try:
-                        # Ambil timestamp dari try block if available, else current time
-                        t_str = str(pd.Timestamp.now(tz=None))
-                        msg_time = locals().get("timestamp", t_str)
-                        self.telegram_handler.flush_to_telegram(header=f"🤖 BTC 5m Predictions (Past 15m) @ {msg_time}")
-                        self._pred_counter = 0
-                    except Exception as e:
-                        print(f"Failed to flush telegram handler: {e}")
+            if self.telegram_notifier:
+                self.telegram_notifier.send(f"🔴 <b>Error processing signal:</b> <code>{str(e)[:200]}</code>")
+                
+    def _on_candle_closed(self, candle_data: dict, timeframe: str):
+        """Callback dipanggil saat candle ditutup oleh StreamManager."""
+        new_row = _parse_candle(candle_data)
+        new_df = pd.DataFrame([new_row]).set_index("open_time")
+        
+        # Append ke buffer
+        if timeframe not in self._kline_buffer:
+            self._kline_buffer[timeframe] = new_df
+        else:
+            self._kline_buffer[timeframe] = pd.concat([self._kline_buffer[timeframe], new_df])
+            # Batasi buffer
+            self._kline_buffer[timeframe] = self._kline_buffer[timeframe].tail(self._lookback + 100)
+            
+        # Trigger prediksi jika timeframe utama (5m) closed
+        if timeframe == self.config["data"]["timeframes"]["primary"]:
+            # Jika dalam mode simulasi, update status trade aktif terlebih dahulu menggunakan lilin baru yang ditutup ini
+            if self.simulate_mode and hasattr(self, "executor") and hasattr(self.executor, "process_candle"):
+                closed_info = self.executor.process_candle({
+                    "open": new_row["open"],
+                    "high": new_row["high"],
+                    "low": new_row["low"],
+                    "close": new_row["close"],
+                    "close_time": new_row["close_time"]
+                })
+                
+                # Kirim notifikasi EXIT jika ada posisi yang closed
+                if closed_info and self.telegram_notifier:
+                    pnl_icon = "🟢" if closed_info["net_pnl"] > 0 else ("🟡" if closed_info["net_pnl"] == 0 else "🔴")
+                    self.telegram_notifier.send(
+                        f"{pnl_icon} <b>SIMULASI PREDIKSI 5M SELESAI: {closed_info['outcome']}</b>\n"
+                        f"Tebakan Arah: {closed_info['pos']['direction']}\n"
+                        f"Harga Entry: ${closed_info['pos']['entry_price']:,.2f}\n"
+                        f"Harga Exit (5m): ${closed_info['exit_price']:,.2f}\n"
+                        f"Token Price: {closed_info['pos']['entry_cost']:.2f} USDT\n"
+                        f"Hasil PnL: <b>{closed_info['net_pnl']:+.2f} USD</b>\n"
+                        f"Saldo Terkini: ${closed_info['new_balance']:,.2f}"
+                    )
+                    
+            self._signal_queue.put(("predict", pd.Timestamp.now(tz=None)))
+
+    def _execution_loop(self):
+        while self._running:
+            try:
+                msg = self._signal_queue.get(timeout=1.0)
+                if msg[0] == "predict":
+                    self._process_signal()
+            except queue.Empty:
+                continue
+            except Exception as e:
+                logger.error(f"Error in execution loop: {e}")
 
     def stop(self):
         self._running = False
@@ -404,3 +473,4 @@ class LivePredictor:
         if hasattr(self.executor, "close_all_positions"):
             self.executor.close_all_positions()
         logger.info("LivePredictor gracefully stopped")
+

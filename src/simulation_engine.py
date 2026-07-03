@@ -24,7 +24,8 @@ class SimulationEngine:
         
         self._pred_logger = pred_logger
         self._position = None  # Menyimpan posisi aktif
-        self.simulated_balance = 10000.0  # Balance simulasi awal $10,000
+        self.simulated_balance = 50.0  # Balance simulasi awal $50
+
         
         # Inisialisasi DB untuk menyimpan balance simulasi harian/transaksi
         self.db_path = config["logging"]["db_path"]
@@ -61,51 +62,66 @@ class SimulationEngine:
         conn.commit()
         conn.close()
 
-    def submit_order(self, direction: str, proba: float, entry_price: float, timestamp):
+    def submit_order(self, direction: str, proba: float, entry_price: float, timestamp, market_ratio_up: float = None):
         """
         Simulasi masuk posisi (UP / DOWN) di awal candle baru.
-        entry_price adalah harga close dari candle 5m yang baru ditutup (paling mendekati harga open candle baru).
+        entry_price adalah harga close dari candle 5m yang baru ditutup.
         """
         if self._position is not None:
             logger.debug("Sudah ada posisi simulasi aktif, lewati sinyal baru.")
-            return
+            return None
 
-        # Sinyal simulasi baru dengan flat $1.00 USD
+        # Ambil parameter dari config
+        pm_cfg = self.config["trading"].get("predict_market", {})
+        bet_size = pm_cfg.get("bet_size_usd", 1.0)
+        pool_source = pm_cfg.get("pool_ratio_source", "model_proba")
+        
+        # Tentukan market ratio up
+        if market_ratio_up is None:
+            if pool_source == "fixed":
+                market_ratio_up = pm_cfg.get("fixed_ratio_up", 0.50)
+            else:
+                market_ratio_up = proba # Gunakan probabilitas model sebagai proxy
+                
+        # Hitung entry_cost (harga token) per $1 bet
+        if direction == "UP":
+            entry_cost = market_ratio_up
+        else:
+            entry_cost = 1.0 - market_ratio_up
+            
+        # Batasi entry cost agar tidak 0 atau >= 1.0 (karena minimal di Binance 0.01 dan max 0.99)
+        entry_cost = max(0.01, min(0.99, entry_cost))
+        
         self._position = {
             "entry_time": timestamp,
             "entry_price": entry_price,
             "direction": direction,
             "predicted_proba": proba,
+            "market_ratio_up": market_ratio_up,
+            "entry_cost": entry_cost,
+            "bet_size": bet_size,
             "candles_held": 0
         }
         
         logger.info(
-            f"🚀 [SIMULATION ENTRY] Prediksi {direction} @ {entry_price:.2f} USDT (Bet Size: $1.00 USD)"
+            f"🚀 [SIMULATION ENTRY] Prediksi {direction} @ {entry_price:.2f} USDT "
+            f"(Token Price: {entry_cost:.2f} USDT, Bet: ${bet_size:.2f})"
         )
-        
-        # Kirim notifikasi Telegram jika handler terdaftar
-        self._send_telegram_notification(
-            f"🚀 <b>SIMULASI ENTRY PREDIKSI 5M: {direction}</b>\n"
-            f"Harga Entry: ${entry_price:,.2f}\n"
-            f"Bet Size: $1.00 USD\n"
-            f"Confidence: {proba:.2%}"
-        )
+        return self._position
 
     def process_candle(self, candle_close_data: dict):
         """
         Dipanggil setiap kali candle 5m ditutup untuk memperbarui status posisi simulasi aktif.
-        candle_close_data: dict berisi open, high, low, close, close_time
         """
         if self._position is None:
-            return
+            return None
 
         pos = self._position
-        
         close = float(candle_close_data["close"])
         open_val = float(candle_close_data["open"])
         close_time = candle_close_data["close_time"]
         
-        # Tentukan tebakan benar atau salah
+        # Tentukan apakah tebakan benar
         if pos["direction"] == "UP":
             win = close > open_val
         else: # DOWN
@@ -113,19 +129,25 @@ class SimulationEngine:
             
         draw = close == open_val
         
+        # Payout pool-ratio: 
+        # Jika menang -> Token bernilai $1.00. Profit bersih = (1.0 - entry_cost) * bet_size
+        # Jika kalah -> Token bernilai $0.00. Rugi bersih = -entry_cost * bet_size
+        # Jika draw -> Return modal (0.0 PnL)
+        pm_cfg = self.config["trading"].get("predict_market", {})
+        fee_pct = pm_cfg.get("platform_fee_pct", 0.01)
+        fee = pos["bet_size"] * fee_pct
+        
         if draw:
             exit_reason = "DRAW"
             net_pnl = 0.0
         elif win:
             exit_reason = "WIN"
-            # Profit bersih $0.85 jika tebakan benar (asumsi payout multiplier 1.85x)
-            net_pnl = 0.85
+            net_pnl = (pos["bet_size"] * (1.0 - pos["entry_cost"])) - fee
         else:
             exit_reason = "LOSS"
-            # Rugi modal $1.00 jika tebakan salah
-            net_pnl = -1.00
+            net_pnl = -(pos["bet_size"] * pos["entry_cost"]) - fee
             
-        self._close_position(close, exit_reason, net_pnl, close_time)
+        return self._close_position(close, exit_reason, net_pnl, close_time)
 
     def _close_position(self, exit_price: float, outcome: str, net_pnl: float, exit_time):
         pos = self._position
@@ -140,11 +162,11 @@ class SimulationEngine:
             "exit_time": str(exit_time),
             "entry_price": pos["entry_price"],
             "exit_price": exit_price,
-            "quantity": 1.0, # Taruhan flat $1.00
+            "quantity": pos["bet_size"],
             "direction": pos["direction"].lower(),
-            "gross_pnl": net_pnl,
+            "gross_pnl": net_pnl, # Simplified gross = net
             "net_pnl": net_pnl,
-            "fee_paid": 0.0,
+            "fee_paid": pos["bet_size"] * self.config["trading"].get("predict_market", {}).get("platform_fee_pct", 0.01),
             "exit_reason": outcome,
             "predicted_proba": pos["predicted_proba"],
         }
@@ -159,33 +181,15 @@ class SimulationEngine:
         else:
             logger.warning("Warning: pred_logger tidak di-set di SimulationEngine, trade tidak disimpan ke DB!")
             
-        # Kirim notifikasi Telegram
-        pnl_icon = "🟢" if net_pnl > 0 else ("🟡" if net_pnl == 0 else "🔴")
-        self._send_telegram_notification(
-            f"{pnl_icon} <b>SIMULASI PREDIKSI 5M SELESAI: {outcome}</b>\n"
-            f"Tebakan Arah: {pos['direction']}\n"
-            f"Harga Entry: ${pos['entry_price']:,.2f}\n"
-            f"Harga Exit (5m): ${exit_price:,.2f}\n"
-            f"Hasil PnL: <b>{net_pnl:+.2f} USD</b>\n"
-            f"Saldo Terkini: ${new_balance:,.2f}"
-        )
+        # Simpan state lama untuk dikembalikan ke pemanggil
+        closed_position_info = {
+            "pos": pos,
+            "outcome": outcome,
+            "net_pnl": net_pnl,
+            "new_balance": new_balance,
+            "exit_price": exit_price
+        }
         
         # Reset posisi
         self._position = None
-
-    def _send_telegram_notification(self, text: str):
-        bot_token = os.getenv("BOT_TOKEN")
-        bot_target_id = os.getenv("BOT_TARGET_ID")
-        if bot_token and bot_target_id:
-            import requests
-            url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
-            try:
-                payload = {
-                    "chat_id": bot_target_id,
-                    "text": text,
-                    "parse_mode": "HTML"
-                }
-                res = requests.post(url, json=payload, timeout=5)
-                res.raise_for_status()
-            except Exception as e:
-                logger.error(f"Gagal mengirim notifikasi Telegram: {e}")
+        return closed_position_info

@@ -46,7 +46,7 @@ class TestBacktest:
             assert trade.entry_time > df.index[0], "Entry time terjadi terlalu cepat!"
             
     def test_payout_calculation(self):
-        """Verifikasi bahwa payout (+0.85 untuk WIN, -1.00 untuk LOSS) dihitung secara akurat."""
+        """Verifikasi bahwa payout pool-ratio dihitung secara akurat."""
         df = make_dummy_kline_with_features(5)
         df.iloc[0, df.columns.get_loc("close")] = 50000.0
         df.iloc[1, df.columns.get_loc("open")] = 50000.0
@@ -56,19 +56,22 @@ class TestBacktest:
         df.iloc[2, df.columns.get_loc("close")] = 49900.0 # candle T=2 close < open => DOWN win
         
         model = MockModel(always_predict_proba=0.8)
-        config = BacktestConfig(probability_threshold=0.60, win_payout_pct=0.85, loss_payout_pct=-1.00)
+        # Dengan proba=0.8, direction UP -> entry_cost = 0.8. fee = 1% * 1.0 = 0.01.
+        # Jika WIN (T=1): PnL = (1.0 - 0.8) - 0.01 = 0.19
+        # Jika LOSS (T=2): PnL = -0.8 - 0.01 = -0.81
+        config = BacktestConfig(probability_threshold=0.60, platform_fee_pct=0.01)
         trades, _ = run_backtest(df, model, FEATURE_COLS, config)
         
         assert len(trades) >= 2
         # Trade ke-0 (sinyal di candle 0, eksekusi di candle 1):
         assert trades[0].direction == "up"
         assert trades[0].exit_reason == "WIN"
-        assert trades[0].net_pnl == 0.85
+        assert abs(trades[0].net_pnl - 0.19) < 1e-6
         
         # Trade ke-1 (sinyal di candle 1, eksekusi di candle 2):
         assert trades[1].direction == "up"
         assert trades[1].exit_reason == "LOSS"
-        assert trades[1].net_pnl == -1.00
+        assert abs(trades[1].net_pnl - (-0.81)) < 1e-6
 
     def test_capital_never_negative(self):
         """Kapital di equity curve tidak boleh negatif."""

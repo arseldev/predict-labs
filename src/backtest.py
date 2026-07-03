@@ -25,12 +25,13 @@ class BacktestConfig:
     max_daily_loss_pct: float = 0.03     # Stop trading jika rugi >3% sehari
     max_weekly_loss_pct: float = 0.08    # Stop trading jika rugi >8% seminggu
     use_triple_barrier: bool = True
-    profit_target_pct: float = 0.0015    # TP: +0.15%
-    stop_loss_pct: float = 0.0015        # SL: -0.15%
+    profit_target_pct: float = 0.0015    # TP: +0.15% (tidak aktif untuk binary predict)
+    stop_loss_pct: float = 0.0015        # SL: -0.15% (tidak aktif untuk binary predict)
     max_hold_candles: int = 6            # Maksimal hold posisi (30 menit)
     bet_size_usd: float = 1.0            # Taruhan flat $1.00 USD
-    win_payout_pct: float = 0.85         # Profit bersih jika tebakan benar
-    loss_payout_pct: float = -1.00       # Rugi bersih jika tebakan salah
+    pool_ratio_source: str = "model_proba" # "model_proba" atau "fixed"
+    fixed_ratio_up: float = 0.50         # Rasio default jika source="fixed"
+    platform_fee_pct: float = 0.01       # 1% platform fee
 
 @dataclass
 class TradeRecord:
@@ -57,10 +58,10 @@ class TradeRecord:
         return self.net_pnl / self.position_size_usdt
 
 def run_backtest(
-    df: pd.DataFrame,
-    model,
-    feature_cols: List[str],
-    config: BacktestConfig
+	df: pd.DataFrame,
+	model,
+	feature_cols: List[str],
+	config: BacktestConfig
 ) -> Tuple[List[TradeRecord], pd.DataFrame]:
     """
     Simulasi trading lilin-demi-lilin (candle-by-candle) untuk Binance Predict 5m.
@@ -116,14 +117,33 @@ def run_backtest(
                 
             draw = close_price == open_price
             
+            # Tentukan pool_ratio_up (persentase UP pool)
+            if config.pool_ratio_source == "fixed":
+                market_ratio_up = config.fixed_ratio_up
+            else:
+                market_ratio_up = proba # Proxy: proba model
+                
+            # Hitung harga token UP/DOWN (0.01 - 0.99)
+            if direction == "up":
+                entry_cost = market_ratio_up
+            else:
+                entry_cost = 1.0 - market_ratio_up
+                
+            entry_cost = max(0.01, min(0.99, entry_cost))
+            
+            # Fee platform
+            fee = config.bet_size_usd * config.platform_fee_pct
+            
             if draw:
                 net_pnl = 0.0
                 exit_reason = "DRAW"
             elif win:
-                net_pnl = config.bet_size_usd * config.win_payout_pct
+                # Menang -> Token bernilai $1.00. Profit = (1.0 - entry_cost) * bet_size
+                net_pnl = config.bet_size_usd * (1.0 - entry_cost) - fee
                 exit_reason = "WIN"
             else:
-                net_pnl = config.bet_size_usd * config.loss_payout_pct
+                # Kalah -> Token bernilai $0.00. Rugi = -entry_cost * bet_size
+                net_pnl = -(config.bet_size_usd * entry_cost) - fee
                 exit_reason = "LOSS"
                 
             capital += net_pnl
@@ -138,7 +158,7 @@ def run_backtest(
                 position_size_btc=0.0,
                 predicted_proba=proba,
                 gross_pnl=net_pnl,
-                fee_paid=0.0,
+                fee_paid=fee,
                 slippage_cost=0.0,
                 net_pnl=net_pnl,
                 exit_reason=exit_reason
@@ -151,3 +171,4 @@ def run_backtest(
     if not equity_df.empty:
         equity_df.set_index("timestamp", inplace=True)
     return trades, equity_df
+

@@ -77,6 +77,12 @@ trading:
   max_hold_candles: 12            # Maksimal hold posisi (1 jam)
   max_daily_loss_pct: 0.03         # Kill-switch: stop jika rugi >3%/hari
   max_weekly_loss_pct: 0.08        # Kill-switch: stop jika rugi >8%/minggu
+  predict_market:
+    bet_size_usd: 1.0              # Taruhan flat per prediksi
+    platform_fee_pct: 0.01         # Fee Binance Predict (1% dari bet)
+    pool_ratio_source: "model_proba" # "model_proba" atau "fixed"
+    fixed_ratio_up: 0.50           # Hanya dipakai jika pool_ratio_source="fixed"
+
 
 logging:
   db_path: "logs/predictions.db"
