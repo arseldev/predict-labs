@@ -32,5 +32,5 @@ RUN mkdir -p data logs models && chmod -R 777 data logs models
 # Expose port (if you want to add a monitoring API later, default is none)
 # EXPOSE 8000
 
-# Set default entrypoint command to run paper trading
-CMD ["python", "main.py", "--mode", "paper"]
+# Set default entrypoint command to run simulation
+CMD ["python", "main.py", "--mode", "simulate"]

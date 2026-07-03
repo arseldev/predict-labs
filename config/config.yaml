@@ -21,7 +21,7 @@ data:
     depth_levels: 20
     snapshot_interval_sec: 30
   history:
-    days_back: 29
+    days_back: 180
 
 features:
   lookback_candles: 100
@@ -37,12 +37,12 @@ features:
     - 10
 
 labeling:
-  method: "triple_barrier"          # "fixed_horizon" atau "triple_barrier"
+  method: "fixed_horizon"           # Prediksi UP/DOWN 1 candle berikutnya (5 menit ke depan)
   fixed_horizon:
-    n_candles_ahead: 1
+    n_candles_ahead: 1              # 1 candle = 5 menit ke depan
   triple_barrier:
-    profit_pct: 0.006               # +0.60% take profit
-    loss_pct: 0.004                 # -0.40% stop loss
+    profit_pct: 0.006               # +0.60% take profit (tidak aktif, disimpan untuk referensi)
+    loss_pct: 0.004                 # -0.40% stop loss (tidak aktif)
     max_candles: 12                 # Max 1 jam (12 × 5m)
 
 model:
@@ -61,8 +61,8 @@ validation:
   method: "walk_forward"
   walk_forward:
     n_splits: 5
-    train_period_days: 15
-    test_period_days: 2
+    train_period_days: 60
+    test_period_days: 7
     embargo_periods: 12             # 1 jam embargo (12 × 5m)
     min_train_samples: 500
 
@@ -70,7 +70,7 @@ trading:
   fee_taker: 0.001                  # 0.10% fee taker
   fee_maker: 0.001                  # 0.10% fee maker
   slippage_pct: 0.0002              # 0.02% estimasi slippage
-  probability_threshold: 0.60      # Min P(naik) untuk entry
+  probability_threshold: 0.52      # Min P(naik) untuk entry — sesuai prediksi arah 5m
   position_size_pct: 0.02          # 2% kapital per trade
   profit_target_pct: 0.006        # TP: +0.60%
   stop_loss_pct: 0.004            # SL: -0.40%

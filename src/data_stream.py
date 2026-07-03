@@ -7,16 +7,32 @@ Kelas utama:
   - _handle_kline(): Callback untuk kline closed event
   - _handle_depth(): Callback untuk order book depth updates
   - _handle_trade(): Callback untuk aggTrade events
+  - _health_monitor(): Thread untuk monitoring kesehatan stream
 """
 
 import os
+import ssl
 import time
 import threading
-from datetime import datetime
+from datetime import datetime, timezone
 import pandas as pd
 import numpy as np
 from pathlib import Path
 from loguru import logger
+
+# Patch SSL globally untuk mengatasi SSL interception di jaringan lokal (Windows)
+# Harus dilakukan SEBELUM import library WebSocket
+import urllib3
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+_orig_ssl_context = ssl.create_default_context
+def _patched_ssl_context(*args, **kwargs):
+    ctx = _orig_ssl_context(*args, **kwargs)
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    return ctx
+ssl.create_default_context = _patched_ssl_context
+
 from unicorn_binance_websocket_api import BinanceWebSocketApiManager
 
 class StorageManager:
@@ -144,6 +160,52 @@ class StorageManager:
         df = pd.read_parquet(path)
         return df.tail(n)
 
+    def get_stats(self) -> dict:
+        """
+        Return statistik ringkas dari semua data yang tersimpan.
+        """
+        stats = {}
+        # Kline stats per timeframe
+        for tf in ["1m", "5m", "15m", "1h"]:
+            p = Path(self.raw_path) / "klines" / tf / "data.parquet"
+            if p.exists():
+                try:
+                    df = pd.read_parquet(p)
+                    stats[f"klines_{tf}"] = {
+                        "rows": len(df),
+                        "from": str(df.index.min()),
+                        "to": str(df.index.max()),
+                        "size_mb": round(p.stat().st_size / 1e6, 2)
+                    }
+                except Exception:
+                    stats[f"klines_{tf}"] = {"rows": 0}
+            else:
+                stats[f"klines_{tf}"] = {"rows": 0}
+
+        # Orderbook stats
+        ob_dir = Path(self.raw_path) / "orderbook"
+        ob_files = list(ob_dir.glob("orderbook_*.parquet"))
+        ob_total_rows = 0
+        for f in ob_files:
+            try:
+                ob_total_rows += len(pd.read_parquet(f))
+            except Exception:
+                pass
+        stats["orderbook"] = {"snapshots": ob_total_rows, "files": len(ob_files)}
+
+        # Trades stats
+        tr_dir = Path(self.raw_path) / "trades"
+        tr_files = list(tr_dir.glob("trades_*.parquet"))
+        tr_total_rows = 0
+        for f in tr_files:
+            try:
+                tr_total_rows += len(pd.read_parquet(f))
+            except Exception:
+                pass
+        stats["trades"] = {"records": tr_total_rows, "files": len(tr_files)}
+
+        return stats
+
 
 class StreamManager:
     """
@@ -171,11 +233,29 @@ class StreamManager:
         self._last_depth_snapshot_time = 0.0
         self._last_depth_update_time = 0.0
 
+        # Counters untuk monitoring
+        self._stats = {
+            "klines_received": 0,
+            "klines_closed": 0,
+            "depth_updates": 0,
+            "depth_snapshots_saved": 0,
+            "trades_received": 0,
+            "trades_flushed": 0,
+            "stream_start_time": None,
+            "last_kline_time": None,
+            "last_trade_time": None,
+            "last_depth_time": None,
+        }
+        # Lock untuk time-based buffer flush
+        self._flush_lock = threading.Lock()
+        self._last_trade_flush_time = time.time()
+
     def start(self):
         """
         Mulai websocket streams di thread terpisah.
         """
         self._running = True
+        self._stats["stream_start_time"] = datetime.now(timezone.utc)
         
         # Subscribe Kline streams
         timeframes = [self.config["data"]["timeframes"]["primary"]] + self.config["data"]["timeframes"]["context"]
@@ -204,7 +284,13 @@ class StreamManager:
         # Thread untuk memproses pesan masuk
         self._thread = threading.Thread(target=self._process_loop, daemon=True)
         self._thread.start()
+
+        # Thread health monitor (log status setiap 5 menit)
+        self._health_thread = threading.Thread(target=self._health_monitor, daemon=True)
+        self._health_thread.start()
+
         logger.info(f"StreamManager started for {self.symbol} on {self.ubwa.exchange}")
+        logger.info(f"Subscribed streams: {kline_channels + ['depth@100ms', 'aggTrade']}")
 
     def _process_loop(self):
         while self._running:
@@ -259,12 +345,16 @@ class StreamManager:
         }
         
         df_row = pd.DataFrame([row]).set_index("open_time")
+        self._stats["klines_received"] += 1
+        self._stats["last_kline_time"] = datetime.now(timezone.utc)
         
-        if self.storage:
-            self.storage.append_klines(df_row, timeframe)
-            
-        if is_closed and self.on_candle_closed:
-            self.on_candle_closed(data, timeframe)
+        # Hanya simpan candle yang sudah CLOSED ke storage (anti-lookahead bias)
+        if is_closed:
+            self._stats["klines_closed"] += 1
+            if self.storage:
+                self.storage.append_klines(df_row, timeframe)
+            if self.on_candle_closed:
+                self.on_candle_closed(data, timeframe)
 
     def _handle_depth(self, data: dict):
         # Inisialisasi local orderbook jika kosong
@@ -296,6 +386,9 @@ class StreamManager:
                 self._local_orderbook["asks"].pop(p, None)
             else:
                 self._local_orderbook["asks"][p] = q
+
+        self._stats["depth_updates"] += 1
+        self._stats["last_depth_time"] = datetime.now(timezone.utc)
                 
         # Simpan snapshot berkala sesuai interval
         now = time.time()
@@ -316,6 +409,7 @@ class StreamManager:
         
         if self.storage:
             self.storage.append_orderbook(snapshot)
+            self._stats["depth_snapshots_saved"] += 1
 
     def _handle_trade(self, data: dict):
         row = {
@@ -327,19 +421,68 @@ class StreamManager:
         df_row = pd.DataFrame([row]).set_index("trade_time")
         
         self._trade_buffer.append(df_row)
+        self._stats["trades_received"] += 1
+        self._stats["last_trade_time"] = datetime.now(timezone.utc)
         
-        # Flush buffer ke parquet jika sudah mencapai 100 trades
-        if len(self._trade_buffer) >= 100:
+        # Flush per 500 trades ATAU per 60 detik (mana yang lebih dulu)
+        now = time.time()
+        should_flush = (
+            len(self._trade_buffer) >= 500 or
+            (now - self._last_trade_flush_time) >= 60
+        )
+        if should_flush:
             self._flush_trade_buffer()
 
     def _flush_trade_buffer(self):
-        if not self._trade_buffer:
-            return
-        df = pd.concat(self._trade_buffer)
-        df.sort_index(inplace=True)
-        if self.storage:
-            self.storage.append_trades(df)
-        self._trade_buffer = []
+        with self._flush_lock:
+            if not self._trade_buffer:
+                return
+            df = pd.concat(self._trade_buffer)
+            df.sort_index(inplace=True)
+            if self.storage:
+                self.storage.append_trades(df)
+            self._stats["trades_flushed"] += len(df)
+            self._trade_buffer = []
+            self._last_trade_flush_time = time.time()
+
+    def _health_monitor(self):
+        """
+        Thread background yang log status stream setiap 5 menit.
+        Alert jika tidak ada data masuk dalam 5 menit terakhir.
+        """
+        check_interval = 300  # 5 menit
+        while self._running:
+            time.sleep(check_interval)
+            if not self._running:
+                break
+            now = datetime.now(timezone.utc)
+            uptime_sec = (now - self._stats["stream_start_time"]).total_seconds() if self._stats["stream_start_time"] else 0
+            uptime_h = int(uptime_sec // 3600)
+            uptime_m = int((uptime_sec % 3600) // 60)
+
+            logger.info(
+                f"[HEALTH] Uptime: {uptime_h}h {uptime_m}m | "
+                f"Klines closed: {self._stats['klines_closed']} | "
+                f"Depth snapshots: {self._stats['depth_snapshots_saved']} | "
+                f"Trades flushed: {self._stats['trades_flushed']}"
+            )
+
+            # Alert jika tidak ada kline yang masuk dalam 10 menit
+            if self._stats["last_kline_time"]:
+                secs_since_kline = (now - self._stats["last_kline_time"]).total_seconds()
+                if secs_since_kline > 600:
+                    logger.warning(f"⚠️ No kline received for {secs_since_kline:.0f}s! Stream may be dead.")
+
+            # Alert jika tidak ada trade dalam 5 menit
+            if self._stats["last_trade_time"]:
+                secs_since_trade = (now - self._stats["last_trade_time"]).total_seconds()
+                if secs_since_trade > 300:
+                    logger.warning(f"⚠️ No aggTrade received for {secs_since_trade:.0f}s!")
+
+    def get_stats(self) -> dict:
+        """Return counters untuk monitoring eksternal."""
+        return dict(self._stats)
+
 
     def stop(self):
         """
@@ -349,3 +492,4 @@ class StreamManager:
         self._flush_trade_buffer()
         self.ubwa.stop_manager_with_all_streams()
         logger.info("StreamManager stopped")
+        logger.info(f"Final stats: {self._stats}")

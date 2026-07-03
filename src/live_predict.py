@@ -54,10 +54,26 @@ class PredictionLogger:
                 timestamp TEXT NOT NULL,
                 proba_up REAL NOT NULL,
                 signal INTEGER NOT NULL,
+                direction TEXT,
+                entry_price REAL,
+                exit_price REAL,
+                outcome TEXT,
                 features_json TEXT,
                 created_at TEXT DEFAULT CURRENT_TIMESTAMP
             )
         """)
+        
+        # Migrasi jika kolom tidak ada
+        cursor.execute("PRAGMA table_info(predictions)")
+        columns = [col[1] for col in cursor.fetchall()]
+        if "direction" not in columns:
+            cursor.execute("ALTER TABLE predictions ADD COLUMN direction TEXT")
+        if "entry_price" not in columns:
+            cursor.execute("ALTER TABLE predictions ADD COLUMN entry_price REAL")
+        if "exit_price" not in columns:
+            cursor.execute("ALTER TABLE predictions ADD COLUMN exit_price REAL")
+        if "outcome" not in columns:
+            cursor.execute("ALTER TABLE predictions ADD COLUMN outcome TEXT")
         
         # Tabel trades
         cursor.execute("""
@@ -81,13 +97,21 @@ class PredictionLogger:
         conn.commit()
         conn.close()
         
-    def log(self, timestamp, proba_up: float, signal: bool, features: dict = None):
+    def log(self, timestamp, proba_up: float, signal: bool, direction: str = "NEUTRAL", entry_price: float = None, features: dict = None):
         conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
-        cursor.execute(
-            "INSERT INTO predictions (timestamp, proba_up, signal, features_json) VALUES (?, ?, ?, ?)",
-            (str(timestamp), float(proba_up), int(signal), json.dumps(features) if features else None)
-        )
+        cursor.execute("""
+            INSERT INTO predictions 
+            (timestamp, proba_up, signal, direction, entry_price, features_json) 
+            VALUES (?, ?, ?, ?, ?, ?)
+        """, (
+            str(timestamp), 
+            float(proba_up), 
+            int(signal), 
+            str(direction),
+            float(entry_price) if entry_price else None,
+            json.dumps(features) if features else None
+        ))
         conn.commit()
         conn.close()
         
@@ -185,13 +209,21 @@ class LivePredictor:
             on_candle_closed=self._on_candle_closed
         )
         
-        self.executor = OrderExecutor(config)
         self._pred_logger = PredictionLogger(config["logging"]["db_path"])
+        self.simulate_mode = config.get("simulate_mode", False)
+        
+        if self.simulate_mode:
+            from src.simulation_engine import SimulationEngine
+            self.executor = SimulationEngine(config, pred_logger=self._pred_logger)
+            logger.info("🎮 LivePredictor running in pure SIMULATION mode (No Binance API orders)")
+        else:
+            self.executor = OrderExecutor(config, pred_logger=self._pred_logger)
         
         # Setup Telegram logging if credentials exist in env
         bot_token = os.getenv("BOT_TOKEN")
         bot_target_id = os.getenv("BOT_TARGET_ID")
         self.telegram_handler = None
+        self._pred_counter = 0
         if bot_token and bot_target_id:
             from src.telegram_utils import TelegramBufferedHandler
             self.telegram_handler = TelegramBufferedHandler(bot_token, str(bot_target_id))
@@ -217,13 +249,13 @@ class LivePredictor:
         """Warm up in-memory buffer dengan REST data."""
         from src.data_fetch import get_binance_client, fetch_klines_rest
         
-        testnet = self.config["binance"].get("testnet", True)
-        client = get_binance_client(testnet=testnet)
+        # Gunakan testnet=True agar terhubung ke testnet.binance.vision yang bebas dari SSL block di PC user
+        client = get_binance_client(testnet=True)
         
         timeframes = [self.config["data"]["timeframes"]["primary"]] + self.config["data"]["timeframes"]["context"]
         
         for tf in timeframes:
-            # Ambil data kline 2 hari ke belakang
+            # Ambil data kline 2 days ago
             df = fetch_klines_rest(client, self.config["binance"]["symbol"], tf, start_str="2 days ago UTC")
             self._kline_buffer[tf] = df
             logger.info(f"Warmed up kline buffer for {tf}: {len(df)} candles")
@@ -243,6 +275,15 @@ class LivePredictor:
             
         # Trigger prediksi jika timeframe utama (5m) closed
         if timeframe == self.config["data"]["timeframes"]["primary"]:
+            # Jika dalam mode simulasi, update status trade aktif terlebih dahulu menggunakan lilin baru yang ditutup ini
+            if self.simulate_mode and hasattr(self, "executor") and hasattr(self.executor, "process_candle"):
+                self.executor.process_candle({
+                    "open": new_row["open"],
+                    "high": new_row["high"],
+                    "low": new_row["low"],
+                    "close": new_row["close"],
+                    "close_time": new_row["close_time"]
+                })
             self._signal_queue.put(("predict", pd.Timestamp.now(tz=None)))
 
     def _execution_loop(self):
@@ -296,41 +337,70 @@ class LivePredictor:
             latest_features = df_features[self.feature_cols].iloc[-1:].copy()
             proba = self.model.predict_proba(latest_features)[0, 1]
             timestamp = df_features.index[-1]
+            entry_price = float(df_5m["close"].iloc[-1]) # harga entry adalah close candle 5m yang barusan ditutup
             
-            signal = bool(proba >= self.threshold)
+            # Tentukan arah berdasarkan threshold
+            threshold_up = self.threshold
+            threshold_down = 1.0 - self.threshold
             
-            # Log prediksi
+            if proba >= threshold_up:
+                direction = "UP"
+                signal = True
+            elif proba <= threshold_down:
+                direction = "DOWN"
+                signal = True
+            else:
+                direction = "NEUTRAL"
+                signal = False
+            
+            # Log prediksi ke SQLite
             self._pred_logger.log(
                 timestamp=timestamp,
                 proba_up=proba,
                 signal=signal,
+                direction=direction,
+                entry_price=entry_price,
                 features=latest_features.iloc[0].to_dict()
             )
             
-            logger.info(f"[{timestamp}] P(up)={proba:.4f} | SIGNAL={signal}")
+            # Log ke terminal
+            logger.info(f"[{timestamp}] P(up)={proba:.4f} | DIRECTION={direction} | SIGNAL={signal}")
             
             if signal:
-                # Kirim sinyal order ke Executor
-                self.executor.submit_order(
-                    direction="long",
-                    proba=proba,
-                    timestamp=timestamp
-                )
+                if self.simulate_mode:
+                    self.executor.submit_order(
+                        direction=direction,
+                        proba=proba,
+                        entry_price=entry_price,
+                        timestamp=timestamp
+                    )
+                else:
+                    # Di real order executor (order_market_buy dll) hanya long yang didukung.
+                    # Kita tetap pass ke executor.
+                    self.executor.submit_order(
+                        direction="long" if direction == "UP" else "short",
+                        proba=proba,
+                        timestamp=timestamp
+                    )
                 
         except Exception as e:
             logger.error(f"Error processing signal: {e}", exc_info=True)
         finally:
             if self.telegram_handler:
-                try:
-                    # Ambil timestamp dari try block if available, else current time
-                    t_str = str(pd.Timestamp.now(tz=None))
-                    msg_time = locals().get("timestamp", t_str)
-                    self.telegram_handler.flush_to_telegram(header=f"🤖 BTC 5m Prediction/Save @ {msg_time}")
-                except Exception as e:
-                    print(f"Failed to flush telegram handler: {e}")
+                self._pred_counter += 1
+                if self._pred_counter >= 3:
+                    try:
+                        # Ambil timestamp dari try block if available, else current time
+                        t_str = str(pd.Timestamp.now(tz=None))
+                        msg_time = locals().get("timestamp", t_str)
+                        self.telegram_handler.flush_to_telegram(header=f"🤖 BTC 5m Predictions (Past 15m) @ {msg_time}")
+                        self._pred_counter = 0
+                    except Exception as e:
+                        print(f"Failed to flush telegram handler: {e}")
 
     def stop(self):
         self._running = False
         self.stream_manager.stop()
-        self.executor.close_all_positions()
+        if hasattr(self.executor, "close_all_positions"):
+            self.executor.close_all_positions()
         logger.info("LivePredictor gracefully stopped")

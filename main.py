@@ -11,6 +11,16 @@ import argparse
 import sys
 import os
 import time
+
+# Fix Windows console encoding issues for Unicode log output
+if sys.platform.startswith("win"):
+    try:
+        sys.stdout.reconfigure(encoding="utf-8")
+        sys.stderr.reconfigure(encoding="utf-8")
+    except AttributeError:
+        # Python versions < 3.7
+        pass
+
 from loguru import logger
 import pandas as pd
 from dotenv import load_dotenv
@@ -172,7 +182,8 @@ def run_backtest_flow(config: dict, model_path: str):
         logger.warning("❌ KESIMPULAN: EV <= 0, Sistem rugi setelah fee/slippage. Tune fitur atau model.")
 
 def run_paper_trading(config: dict, model_path: str):
-    logger.info("Starting Paper Trading on Binance Testnet...")
+    mode_name = "Simulation" if config.get("simulate_mode") else "Paper Trading"
+    logger.info(f"Starting {mode_name} on Binance...")
     
     if not os.path.exists(model_path):
         logger.error(f"Trained model not found at {model_path}. Please run backtest first to train a model.")
@@ -183,11 +194,22 @@ def run_paper_trading(config: dict, model_path: str):
     try:
         predictor.start()
         # Keep main thread alive
+        last_eval_time = 0
         while True:
             time.sleep(60)
             # Tampilkan report performa singkat
             perf = predictor._pred_logger.get_live_performance(days_back=1)
             logger.info(f"Live Stats (Past 24h) | Trades: {perf['total_trades']} | Win Rate: {perf['win_rate']:.1%} | Net PnL: ${perf['total_net_pnl']:.2f}")
+            
+            # Auto-evaluate predictions and send Telegram summary every 1 hour (3600 seconds)
+            now = time.time()
+            if now - last_eval_time >= 3600:
+                try:
+                    from evaluate_live import evaluate_predictions
+                    evaluate_predictions(send_tele=True)
+                    last_eval_time = now
+                except Exception as eval_err:
+                    logger.error(f"Error running auto-evaluation: {eval_err}")
     except KeyboardInterrupt:
         logger.info("Shutdown signal received.")
         predictor.stop()
@@ -197,7 +219,7 @@ def run_paper_trading(config: dict, model_path: str):
 
 def main():
     parser = argparse.ArgumentParser(description="BTC 5m Prediction Trading Bot")
-    parser.add_argument("--mode", choices=["backtest", "paper", "live", "retrain"], required=True,
+    parser.add_argument("--mode", choices=["backtest", "paper", "live", "retrain", "simulate"], required=True,
                         help="Mode untuk menjalankan sistem")
     parser.add_argument("--config", default="config/config.yaml", help="Path ke config.yaml")
     parser.add_argument("--model", default="models/latest.pkl", help="Path ke file model pickle")
@@ -215,11 +237,19 @@ def main():
             logger.info("Live mode dibatalkan.")
             return
         config["binance"]["testnet"] = False
+        config["simulate_mode"] = False
         logger.warning("🚨 MENJALANKAN MODE LIVE. HATI-HATI!")
         run_paper_trading(config, args.model)
         
     elif args.mode == "paper":
         config["binance"]["testnet"] = True
+        config["simulate_mode"] = False
+        run_paper_trading(config, args.model)
+        
+    elif args.mode == "simulate":
+        # Gunakan websocket testnet yang bebas dari blokir ISP lokal
+        config["binance"]["testnet"] = True
+        config["simulate_mode"] = True
         run_paper_trading(config, args.model)
         
     elif args.mode in ["backtest", "retrain"]:

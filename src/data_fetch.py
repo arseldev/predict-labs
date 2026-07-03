@@ -76,7 +76,11 @@ def get_binance_client(testnet: bool = True, api_key: str = None, api_secret: st
     """
     Inisialisasi Binance Client.
     Jika api_key/api_secret None, akan meload dari .env berdasarkan status testnet.
+    Mode public (api_key='') bisa dipakai untuk fetch kline historis tanpa auth.
     """
+    import urllib3
+    urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
     load_dotenv()
     if api_key is None or api_secret is None:
         if testnet:
@@ -85,9 +89,15 @@ def get_binance_client(testnet: bool = True, api_key: str = None, api_secret: st
         else:
             api_key = os.getenv("BINANCE_API_KEY", "")
             api_secret = os.getenv("BINANCE_API_SECRET", "")
-            
-    # testnet argument pada Client python-binance
-    client = Client(api_key, api_secret, testnet=testnet)
+
+    # Pass verify=False via requests_params agar ping() di __init__ tidak SSL error
+    # Ini diperlukan di lingkungan dengan proxy/SSL interception (umum di Windows)
+    client = Client(
+        api_key,
+        api_secret,
+        testnet=testnet,
+        requests_params={"verify": False}
+    )
     return client
 
 def fetch_klines_rest(
@@ -177,9 +187,19 @@ def download_bulk_klines(
             df.columns = cols
             if "ignore" in df.columns:
                 df.drop(columns=["ignore"], inplace=True)
-                
-        df["open_time"] = pd.to_datetime(df["open_time"], unit="ms", utc=True)
-        df["close_time"] = pd.to_datetime(df["close_time"], unit="ms", utc=True)
+
+        # Deteksi unit timestamp: Binance bulk CSV mungkin pakai ms atau us
+        # Jika nilai open_time terlalu besar untuk ms (> year 3000), kemungkinan us
+        sample_ts = int(df["open_time"].iloc[0])
+        # year 3000 dalam ms = 32503680000000, kalau lebih dari ini berarti us
+        if sample_ts > 32503680000000:
+            ts_unit = "us"
+        else:
+            ts_unit = "ms"
+
+        df["open_time"] = pd.to_datetime(df["open_time"].astype("int64"), unit=ts_unit, utc=True)
+        if "close_time" in df.columns:
+            df["close_time"] = pd.to_datetime(df["close_time"].astype("int64"), unit=ts_unit, utc=True)
         for col in NUMERIC_COLS:
             if col in df.columns:
                 df[col] = df[col].astype("float64")
